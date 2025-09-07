@@ -1860,6 +1860,194 @@ A: Check Grafana logs immediately after triggering the email. Common fixes: corr
 **Q: Promtail is restarting.**  
 A: YAML/permissions/mounts are the usual causes. Confirm mounts, ensure `/var/lib/docker/containers` and `/var/lib/promtail` are readable, and that the `__path__` relabel points to `$id-json.log`.
 
+ChatGPT Auto-Fix for NestJS
+
+This repository includes a GitHub Actions workflow that uses **ChatGPT (gpt-5)** to automatically fix lint, typecheck, and build issues in a **NestJS + TypeScript** codebase and opens a pull request with the changes.
+
+- **Autofix workflow name:** `ChatGPT Autofix (Nest API root)`
+- **Default trigger:** on push to `dev` (also supports manual `workflow_dispatch`)
+- **Edits are minimal & safe:** public API routes, env var names, and provider contracts are preserved
+- **PRs include rationale:** the bot leaves short notes to reviewers (e.g. `.ai-notes.md`)
+
+> If you also enabled the optional **Typo Scan** workflow, see the appendix at the end.
+
+---
+
+## How it works
+
+1. **Trigger**  
+   When you push to `dev` (or run manually), the workflow starts on `ubuntu-latest`.
+
+2. **Environment & install**
+   - Detects package manager (`pnpm`, `yarn`, `npm`)
+   - Sets up Node 20 and caches dependencies
+   - Installs project dependencies
+
+3. **Signals (non-fatal)**  
+   Runs available scripts (`lint`, `typecheck`, optional `sanity`) to collect diagnostics the model can use as hints.
+
+4. **Changed files only**  
+   Determines which files changed in the push and **scopes the model’s edits to those files**, chunked to respect token limits.
+
+5. **ChatGPT pass**  
+   For each chunk, the workflow sends a compact prompt + the file contents and collected diagnostics to the **Responses API**  
+   (`POST /v1/responses`, model `gpt-5`). The model replies with a **strict JSON** containing full-file rewrites; the runner applies them and stages the edits.
+
+6. **Notes & sentinel**  
+   If the model included notes, they’re appended to `.ai-notes.md`. A sentinel file `.ai-edits-applied` is created when any edit is applied.
+
+7. **PR creation**  
+   If edits were staged, a PR is opened to `dev` via `peter-evans/create-pull-request@v7` with commit message  
+   `chore(chatgpt-api-root): auto-fix lint/types/tests`.
+
+---
+
+## Repository secrets
+
+Create the following **repository secrets** (Settings → Secrets and variables → Actions → New repository secret):
+
+| Secret           | Description                                                                                  |
+| ---------------- | -------------------------------------------------------------------------------------------- |
+| `OPENAI_API_KEY` | Your OpenAI API key with access to `gpt-5`                                                   |
+| `GH_PAT`         | A GitHub Personal Access Token with `repo` scope so the workflow can push a branch & open PR |
+
+> The workflow gracefully logs and exits when `OPENAI_API_KEY` is missing.
+
+---
+
+## Files & paths behavior
+
+- **Ignored for triggers:**  
+  The `on.push.paths-ignore` excludes docs/images/yml/etc. so cosmetic changes don’t trigger the run.
+- **Edit scope:**  
+  Only files changed in the pushed commit range are considered; the model is asked to **touch imports minimally** if needed.
+- **Outputs:**
+  - `.ai-notes.md` — short rationale / follow-ups from the model
+  - `.ai-edits-applied` — sentinel indicating at least one edit was applied (used to detect “real” changes)
+
+---
+
+## Safety rails in the prompt
+
+The workflow instructs the model to:
+
+- Fix **ESLint/Prettier/TypeScript/build** issues with **minimal, safe edits**
+- **Do not** change public **HTTP routes**, **env var names**, or **provider contracts**
+- Keep config changes **narrow** and document them in notes
+- Prefer **local fixes** over sweeping refactors
+
+---
+
+## Running it
+
+### 1) Automatically on push
+
+Push to the `dev` branch:
+
+```bash
+git checkout dev
+git commit -m "wip"
+git push origin dev
+```
+
+### 2) Manually from Actions
+
+- Go to **Actions → ChatGPT Autofix (Nest API root) → Run workflow**
+- Choose the branch (e.g. `dev`) and run
+
+---
+
+## Customization
+
+- **Change the trigger branch**  
+  In the workflow YAML:
+
+  ```yaml
+  on:
+    push:
+      branches: ['dev'] # change to 'main' or another branch if preferred
+  ```
+
+- **Include/exclude paths**  
+  Update `paths-ignore` to tune what pushes trigger a run. You can also add a `paths:` list to only react to certain folders.
+
+- **Node / package manager**  
+  Bump Node in `actions/setup-node@v4` or pin your preferred `pnpm` via `corepack prepare`.
+
+- **Token budgets / chunking**  
+  The script chunks changed files to ~40k characters per batch (~10k tokens). Adjust inside the runner script if needed.
+
+---
+
+## Troubleshooting
+
+**“No changes detected.”**  
+The model chose not to edit anything or couldn’t confidently fix issues in the diff. Check the job log for applied edits; if none, push a failing change or add a `sanity` script to surface errors.
+
+**No PR created.**
+
+- Verify `GH_PAT` is set and valid.
+- The “Detect changes” step prints staged files; if empty, there’s nothing to PR.
+
+**429 rate limits.**  
+The workflow includes lightweight backoff and chunking. If you routinely hit 429s, reduce chunk size or run less frequently.
+
+**OpenAI 400: “Unsupported parameter: temperature.”**  
+The workflow uses the **Responses API** for `gpt-5` and does **not** send `temperature`. If you run any local scripts, remove `temperature` when calling `gpt-5`.
+
+**“Context access might be invalid: typos”**  
+This was from referencing a step’s own outputs in the same step. The current workflows avoid that pattern.
+
+---
+
+## Local dry-run (optional)
+
+You can simulate an autofix run against a single file locally using your API key:
+
+```bash
+export OPENAI_API_KEY=sk-...
+export CHANGED_FILES="src/some/file.ts"
+node scripts/chatgpt-autofix.mjs
+```
+
+> In CI we write the script **ephemerally** to the runner; if you want local runs, keep a copy under `scripts/`.
+
+---
+
+## Security & privacy
+
+- Secrets are read via standard GitHub Actions env (`OPENAI_API_KEY`, `GH_PAT`).
+- The model only sees **changed files** plus high-level diagnostics (lint/typecheck output).
+- The helper script is created in the runner’s temp folder and **is not committed** to the repo.
+
+---
+
+## FAQ
+
+**Will this rewrite my app?**  
+No. The prompt demands **minimal** edits. Large refactors aren’t attempted.
+
+**Does it rely on unit tests to fix bugs?**  
+No. It targets **lint/TS/build** issues primarily. For functional bugs, add failing unit/integration tests to guide fixes.
+
+**Can I run it on every branch?**  
+Yes—add branches to `on.push.branches` or duplicate the job with different settings.
+
+---
+
+## Appendix: Optional Typo Scan (on-demand, full repo)
+
+If you also added the on-demand typo scan workflow:
+
+- **Workflow name:** `ChatGPT Typo Scan (On-Demand Full Repo)`
+- **Trigger:** manual `workflow_dispatch`
+- **Scope:** scans **entire repo** (code & docs) for **obvious** English misspellings  
+  (conservative on identifiers; avoids API-breaking renames)
+- **Output:** `.ai-typos.md` (table of suggestions) and a sentinel `.ai-typos-found`
+- **PR behavior:** opens a PR **only** when suggestions exist
+
+Run it from **Actions → ChatGPT Typo Scan (On-Demand Full Repo) → Run workflow**.
+
 ## 🧾 License
 
 This project is **UNLICENSED** and not for redistribution without written permission.
