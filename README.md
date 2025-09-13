@@ -2048,6 +2048,369 @@ If you also added the on-demand typo scan workflow:
 
 Run it from **Actions → ChatGPT Typo Scan (On-Demand Full Repo) → Run workflow**.
 
+# AI-powered SEO Generation & Prompt Management
+
+This feature automatically generates high‑quality SEO metadata for Events using OpenAI, while giving you a **Prompt Management** system to control the tone/instructions centrally. It also provides **deterministic fallbacks**, **caching**, **metrics**, and **unique storage** per event.
+
+---
+
+## Table of Contents
+
+- [What it does](#what-it-does)
+- [Architecture](#architecture)
+- [Data Models](#data-models)
+- [Normalization & JSON‑LD](#normalization--json-ld)
+- [SEO Generation Flow](#seo-generation-flow)
+- [Prompt Management](#prompt-management)
+- [HTTP APIs](#http-apis)
+- [Caching](#caching)
+- [Metrics](#metrics)
+- [Environment Variables](#environment-variables)
+- [Next.js Integration](#nextjs-integration)
+- [Seeding a Prompt](#seeding-a-prompt)
+- [Troubleshooting](#troubleshooting)
+- [Security Notes](#security-notes)
+
+---
+
+## What it does
+
+- **Generates SEO** (title, description, keywords, OG text, slug) for an event via OpenAI.
+- **Never returns partial SEO**: deterministic hydration fills any missing fields.
+- **Builds JSON‑LD (`schema.org/Event`)** with reliable start/end dates and organizer info.
+- **Stores one SEO doc per event** (enforced by a unique index).
+- **Caches reads** and **invalidates** when SEO is (re)generated.
+- **Tracks metrics**: cache hits/misses, token usage, and latency histograms.
+- **Centralizes prompts** in a `PromptsService` with DB overrides and defaults.
+
+---
+
+## Architecture
+
+```
+[Next.js app] ──► [NestJS API]
+                    ├─ /v1/seo/:eventId (GET)           ──► Mongo[SeoDoc]
+                    ├─ /v1/seo/generate (POST, JWT)     ──► OpenAI + Mongo[SeoDoc]
+                    ├─ /v1/prompts (admin CRUD)         ──► Mongo[PromptDoc]
+                    ├─ CacheService (HTTP key helpers)  ──► Redis or in‑mem
+                    └─ MetricsService                    ──► Prometheus/OTLP/etc.
+```
+
+---
+
+## Data Models
+
+### SeoDoc
+
+```ts
+{
+  _id: ObjectId,
+  eventId: ObjectId | string,         // unique per event (enforced)
+  contentHash: string,                // stable hash over SEO-relevant fields
+  seo: SeoPack,                       // the generated+hydrated pack
+  createdAt: Date,
+  updatedAt: Date
+}
+```
+
+### SeoPack (response shape)
+
+```ts
+type SeoPack = {
+  seoTitle: string;
+  seoDescription: string;
+  keywords: string[];
+  ogTitle: string;
+  ogDescription: string;
+  ogImageText?: string;
+  canonicalPath: string;
+  robots: { index: boolean; follow: boolean };
+  slug: string;
+  jsonLd: Record<string, any>; // schema.org/Event
+};
+```
+
+### PromptDoc
+
+```ts
+{
+  _id: ObjectId,
+  ns: string,               // e.g. "seo"
+  key: string,              // e.g. "system"
+  locale?: string | null,   // e.g. "en-IN" (nullable)
+  text: string,             // the prompt body (templated or static)
+  version?: number,
+  meta?: Record<string, any>,
+  createdAt: Date,
+  updatedAt: Date
+}
+```
+
+---
+
+## Normalization & JSON‑LD
+
+1. **normalizeEvent(raw)** → `EventNorm` ensures date/times become ISO strings (`dateFromISO`, `dateToISO`) and pulls core fields (title, city, venue, highlights, exams, courses…).
+2. **buildEventJsonLd(norm, seoPack)** → Generates a schema.org/Event object:
+   - Uses `seoPack.seoDescription` for `description`
+   - Converts `dateFromISO` and `dateToISO` to `startDate`/`endDate`
+   - Includes organizer details if available
+   - Adds keywords (exams/courses) safely
+
+> If a field is missing from OpenAI, hydration ensures `seoPack` still contains valid values to drive JSON‑LD.
+
+---
+
+## SEO Generation Flow
+
+1. **Normalize** incoming event → `norm`
+2. **Hash** SEO‑relevant fields → `contentHash`
+3. **Check stored SEO** by `(eventId, contentHash)` (short‑circuit on hit unless `force`)
+4. **Fetch system prompt** via `PromptsService.get('seo','system')` with DB, env, or defaults
+5. **Call OpenAI**:
+   - Prefer `json_schema` response format (for dated 4o models)
+   - Otherwise use **tool‑calling strict** mode (works with `gpt-5`, `o4-mini`)
+6. **Hydrate** model output with deterministic fallbacks (always complete)
+7. **Build JSON‑LD** using hydrated values
+8. **Upsert** a single record per event (unique constraint)
+9. **Invalidate** cache keys for this event
+10. **Emit metrics** for calls/latency/tokens
+
+---
+
+## Prompt Management
+
+The system prompt is not hardcoded. It is resolved in this order:
+
+1. **DB override**: a `PromptDoc` with `ns="seo"`, `key="system"`, and matching `locale` (if provided)
+2. **Env var**: `PROMPT_SEO__SYSTEM`
+3. **Built‑in default** (`PROMPT_DEFAULTS.seo.system`)
+
+You can manage prompts via admin APIs (below). Prompts are cached with TTL and can interpolate variables.
+
+---
+
+## HTTP APIs
+
+### SEO (public)
+
+#### `GET /v1/seo/:eventId` _(BasicAuth)_
+
+Fetch the cached SEO pack for an event.
+
+- **Auth**: `Basic` (consistent with Event GET; configurable)
+- **Caching**: enabled via decorators; key varies by `:eventId`
+- **Response**: `SeoPack | null`
+
+**Example:**
+
+```bash
+curl -u "$BASIC_USER:$BASIC_PASS" \
+  http://localhost:4000/v1/seo/68a385080db39ab6dcb9c4d7
+```
+
+#### `POST /v1/seo/generate?force=1` _(JWT)_
+
+Generate (or refresh) SEO for an event. You can pass the event payload or only the `eventId` (the service will fetch the event server‑side).
+
+**Body:**
+
+```json
+{
+  "eventId": "68a385080db39ab6dcb9c4d7",
+  "event": {
+    /* optional: raw event json; if omitted, server loads by eventId */
+  },
+  "force": "1"
+}
+```
+
+**Response:** `SeoPack`
+
+**Notes:**
+
+- If `force` is `1|true`, the content hash short‑circuit is bypassed.
+- On success, route invalidates related cache keys.
+
+---
+
+### Prompts (admin)
+
+#### `GET /v1/prompts?ns=seo&key=system&locale=en-IN&limit=50&offset=0` _(BasicAuth)_
+
+List prompts filtered by namespace/key/locale with pagination.
+
+#### `GET /v1/prompts/lookup?ns=seo&key=system&locale=en-IN` _(BasicAuth)_
+
+Lookup a single prompt by its unique triplet.
+
+#### `GET /v1/prompts/:id` _(BasicAuth)_
+
+Fetch prompt by id.
+
+#### `POST /v1/prompts` _(JWT)_
+
+Create a new prompt (fails if the (ns,key,locale) exists).
+
+#### `PUT /v1/prompts/upsert` _(JWT)_
+
+Create or update a prompt by (ns,key,locale).
+
+#### `PATCH /v1/prompts/:id` _(JWT)_
+
+Update by id (also invalidates caches for both old and new keys).
+
+#### `DELETE /v1/prompts/:id` _(JWT)_
+
+Delete by id (invalidates cache for that key).
+
+---
+
+## Caching
+
+- **HTTP caching** via decorators:
+  - `@HttpCacheTTL(ms)` and `@HttpCacheKeyFromParam('eventId', 'seo:')`
+  - `@AllowAuthCache()` allows caching even when guards are present
+- **SeoService** mirrors `EventsService` invalidation:
+  - Busts the list key (`seo:list:v1`) and both URL/alias keys for a single event
+- **PromptsService** caches prompt lookups with TTL; invalidated on writes
+
+---
+
+## Metrics
+
+Emitted via `MetricsService`:
+
+- **Counters**
+  - `seo_cache_events_total{type=hit|miss}`
+  - `seo_generate_calls_total{model,mode,status}`
+  - `seo_openai_tokens_total{model,mode,kind=input|output|total}`
+- **Histograms**
+  - `seo_generate_latency_ms{model,mode,status}` with buckets `[50,100,200,500,1000,2000,5000,10000]`
+
+Use these to build dashboards/alerts.
+
+---
+
+## Environment Variables
+
+| Variable                      | Example                    | Purpose                                                         |
+| ----------------------------- | -------------------------- | --------------------------------------------------------------- |
+| `OPENAI_API_KEY`              | `sk-...`                   | OpenAI access token                                             |
+| `OPENAI_SEO_MODEL`            | `gpt-5`                    | Preferred model (`gpt-5`, `o4-mini`, `gpt-4o-2024-08-06`, etc.) |
+| `PROMPT_SEO__SYSTEM`          | _long text_                | Env‑level system prompt (fallback)                              |
+| `NEXT_PUBLIC_USE_BASIC_AUTH`  | `true`                     | Adds Basic auth to API calls from Next                          |
+| `NEXT_PUBLIC_BASIC_AUTH_USER` | `admin`                    | Basic user (Next only)                                          |
+| `NEXT_PUBLIC_BASIC_AUTH_PASS` | `secret`                   | Basic pass (Next only)                                          |
+| `API_URL`                     | `http://localhost:4000/v1` | SSR base URL                                                    |
+| `NEXT_PUBLIC_API_URL`         | `http://localhost:4000/v1` | Browser base URL                                                |
+| `NEXT_PUBLIC_USE_PROXY`       | `true`                     | Use `/api` Next proxy in dev                                    |
+| Mongo/Redis/etc.              | —                          | Standard Mongoose/Cache configuration                           |
+
+> **Temperature**: Only set for the dated `gpt-4o-*` models in the Responses API. For `gpt-5`/`o4-mini`, we omit it to avoid API errors.
+
+---
+
+## Next.js Integration
+
+1. **Axios client** (`lib/api.ts`) handles Basic/JWT and SSR cookie forwarding.
+2. **SEO service** (`services/seoService.ts`):
+   ```ts
+   export const fetchSeoByEventId = async (eventId: string) => {
+     return api.get<SeoPack | null>(`/seo/${eventId}`, { cache: 'no-store' });
+   };
+   ```
+3. **Page SEO** (`app/event/[id]/page.tsx`) using your generic builder:
+
+   ```ts
+   export async function generateMetadata({
+     params,
+   }: {
+     params: Promise<{ id: string }>;
+   }): Promise<Metadata> {
+     const { id } = await params;
+     let seo: SeoPack | null = null;
+
+     try {
+       const res = await fetchSeoByEventId(id);
+       seo = res.data ?? null;
+     } catch {}
+
+     if (!seo) {
+       const ev = await loadEvent(id);
+       if (!ev) return { title: 'Event not found' };
+       seo = await generateSeo(id, ev);
+     }
+
+     return buildMetadataFromResource<SeoPack>({
+       fetcher: async () => seo,
+       pick: (s) => ({
+         title: s.seoTitle,
+         description: s.seoDescription,
+         path: s.canonicalPath,
+         keywords: s.keywords,
+       }),
+       fallbackTitle: 'Event Details',
+       fallbackDescription: 'Event information and registration.',
+       overrides: {
+         robots: { index: seo.robots.index, follow: seo.robots.follow },
+       },
+     });
+   }
+   ```
+
+---
+
+## Seeding a Prompt
+
+Use **admin API** to upsert the system prompt:
+
+```bash
+curl -X PUT "http://localhost:4000/v1/prompts/upsert" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ns": "seo",
+    "key": "system",
+    "locale": "en-IN",
+    "text": [
+      "You are an SEO writer for a university/career events website in India.",
+      "Only use facts from the provided event JSON. Do NOT invent details.",
+      "Keep titles <=60 chars, descriptions <=155 chars. Avoid clickbait.",
+      "Return a short, clean slug (kebab-case).",
+      "Use IST (Asia/Kolkata) context for dates/times."
+    ].join(" ")
+  }'
+```
+
+---
+
+## Troubleshooting
+
+- **“Unknown parameter: tool_choice.\*”**  
+  You’re calling Responses API with unsupported `tool_choice`. Remove it.
+- **“Unsupported parameter: temperature”**  
+  Don’t set `temperature` for `gpt-5`/`o4-mini`. Only the dated `gpt-4o-*` Responses models accept it.
+- **OpenAI returns text, not structured output**  
+  We parse `tool_call` arguments first; if missing, we try `output_text`. Hydration then guarantees a full pack.
+- **Null `startDate`/`endDate`**  
+  Ensure `normalizeEvent()` sets `dateFromISO`/`dateToISO`. The JSON‑LD builder uses those ISO strings to set dates.
+- **GET /seo/:id returns null**  
+  If your collection stores `ObjectId` for `eventId`, the service now queries by `ObjectId` **or** string to match both.
+- **Multiple docs for the same event**  
+  A unique index on `{ eventId: 1 }` prevents duplicates. On `11000`, the service falls back to an `updateOne`.
+
+---
+
+## Security Notes
+
+- Reads can be protected via **BasicAuth**; writes (generate, prompts CRUD) require **JWT**.
+- Axios SSR forwards cookies, and your API refreshes tokens when 401 (except auth routes).
+- Avoid logging secrets; request/response interceptors redact `Authorization` headers.
+- Robots defaults to `{ index: true, follow: true }`. Adjust per route if needed.
+
+---
+
 ## 🧾 License
 
 This project is **UNLICENSED** and not for redistribution without written permission.
@@ -2055,3 +2418,11 @@ This project is **UNLICENSED** and not for redistribution without written permis
 ```
 
 ```
+
+## Feature Guides
+
+- [AI SEO Generation (Events)](docs/seo-generation.md)
+
+## Feature Guides
+
+- [Prompts Registry](docs/prompts.md)
