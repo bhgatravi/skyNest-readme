@@ -2088,26 +2088,32 @@ This feature automatically generates high‑quality SEO metadata for Events usin
 ## Architecture
 
 ```
-[Next.js app] ──► [NestJS API]
-                    ├─ /v1/seo/:eventId (GET)           ──► Mongo[SeoDoc]
-                    ├─ /v1/seo/generate (POST, JWT)     ──► OpenAI + Mongo[SeoDoc]
-                    ├─ /v1/prompts (admin CRUD)         ──► Mongo[PromptDoc]
-                    ├─ CacheService (HTTP key helpers)  ──► Redis or in‑mem
-                    └─ MetricsService                    ──► Prometheus/OTLP/etc.
+[Next.js] ───────────(Axios)──────────▶ [/v1/seo/:eventId]
+   │                                           │
+   │ fetchSeoByEventId                         │  SeoController
+   ▼                                           ▼
+generateMetadata()                   SeoService.generate(event,eventId,force)
+                                              │
+                                              ├─ normalizeEvent(raw)
+                                              ├─ build prompt (PromptsService: ns=seo,key=system)
+                                              ├─ call OpenAI (gpt‑5|o4‑mini|4o-dated)
+                                              ├─ hydrate with deterministic defaults
+                                              ├─ buildEventJsonLd(norm, hydrated)
+                                              └─ upsert {eventId, contentHash, seo} in Mongo
 ```
 
 ---
 
-## Data Models
+## Data Model
 
-### SeoDoc
+**Collection:** `seodocs`
 
 ```ts
 {
   _id: ObjectId,
-  eventId: ObjectId | string,         // unique per event (enforced)
-  contentHash: string,                // stable hash over SEO-relevant fields
-  seo: SeoPack,                       // the generated+hydrated pack
+  eventId: ObjectId | string,        // unique with contentHash
+  contentHash: string,               // sha1(SEO-relevant seed)
+  seo: SeoPack,                      // AI+deterministic pack
   createdAt: Date,
   updatedAt: Date
 }
