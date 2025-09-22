@@ -2417,11 +2417,133 @@ curl -X PUT "http://localhost:4000/v1/prompts/upsert" \
 
 ---
 
-## 🧾 License
+# Bug Tracking & Error Reporting (NestJS) — Quick README
 
-This project is **UNLICENSED** and not for redistribution without written permission.
+A drop‑in module to **capture, dedupe, assign, and track** backend (NestJS) errors — plus accept **frontend error intake** (from Next.js or any client) — and store them in MongoDB. Supports **Slack alerts** and can be **enabled/disabled via env**.
+
+---
+
+## Features
+
+- **Global capture** via `HttpExceptionFilter` (registered app‑wide)
+  - Classifies **5xx** as `severity=BUG`
+  - Classifies **408/429** as `severity=WARNING` (optional triage)
+  - Fingerprints errors (stable SHA‑256) to dedupe recurring issues
+  - Records request context, sanitized payload samples, and increments an `occurrences` counter
+- **Frontend intake** endpoint (`POST /bug-intake`) to ingest errors reported by your web app
+- **Admin APIs** to list, assign, and update bug status (Swagger documented)
+- **Slack alerts** (optional)
+- **Feature toggles** via environment variables
+
+---
+
+## TL;DR — Setup
+
+1. **Enable module**
+   - In Nest: set `BUG_TRACKING_ENABLED=true`
+   - (Optional) Slack: `BUG_SLACK_ENABLED=true` + `BUG_SLACK_WEBHOOK=...`
+
+2. **Import module (conditional)**
+   - In `app.module.ts`: import `BugTrackerModule` only when `BUG_TRACKING_ENABLED=true`
+
+3. **Register global filter**
+   - In `main.ts`: register `HttpExceptionFilter` (DI-injected with `BugTrackerService`)
+
+4. **Expose admin APIs**
+   - `GET /admin/bug-reports` (filters: `status`, `severity`, `route`, `q`)
+   - `PATCH /admin/bug-reports/:fingerprint/assign`
+   - `PATCH /admin/bug-reports/:fingerprint/status`
+   - These are already documented in Swagger
+
+5. **Create frontend intake endpoint**
+   - `POST /bug-intake` (protected by `x-bug-intake-token`)
+   - Compute fingerprint and call `BugTrackerService.recordOrUpdate(...)`
+
+6. **Next.js integration (client)**
+   - Global error screen: re-export a central `ErrorScreen`
+   - Axios interceptor: report `network/timeout` + `5xx`
+   - Next proxy route `/api/bug-intake` forwards to Nest `BUG_INTAKE_URL` with server-only `BUG_INTAKE_TOKEN`
+
+---
+
+## Environment (minimal)
+
+**NestJS**
 
 ```
+BUG_TRACKING_ENABLED=true
+BUG_SLACK_ENABLED=false           # true to enable Slack
+BUG_SLACK_WEBHOOK=...             # if using webhook
+```
+
+**Next.js**
+
+```
+ERROR_REPORTING_ENABLED=true
+BUG_INTAKE_URL=https://api.yourdomain.com/v1/bug-intake
+BUG_INTAKE_TOKEN=super-long-random
+```
+
+> Use a **Next proxy route** (`/api/bug-intake`) so tokens stay **server-only**.
+
+---
+
+## Data model (at a glance)
+
+- `fingerprint` (unique), `route`, `statusCode`
+- `status` (`NEW`, `TRIAGED`, `ASSIGNED`, `IN_PROGRESS`, `RESOLVED`, `WONT_FIX`)
+- `severity` (`BUG` | `WARNING`), `occurrences`, `lastSeen`, `resolvedAt?`
+- `message`, `name`, `stack`
+- `assigneeId`, `assigneeName`
+- `tags[]`, `context`, `samplePayload`, `sentryEventId`, `history[]`
+
+**Indexes**: `fingerprint (unique)`, `lastSeen`, `(status,lastSeen)`, `(severity,lastSeen)`, `(route,lastSeen)`
+
+---
+
+## How it classifies
+
+- **5xx** → `severity=BUG` (tracked)
+- **408 / 429** → `severity=WARNING` (tracked)
+- **4xx** → not tracked as bugs (normal responses/logs)
+
+---
+
+## Admin flow
+
+1. List & filter by `severity`/`status`
+2. Assign to a developer
+3. Update status (adds audit history, stamps `resolvedAt`)
+4. Optional Slack notifications
+
+---
+
+## Security & privacy
+
+- Frontend intake requires `x-bug-intake-token` (server-held secret)
+- Request payloads are sanitized (redacts common secret keys)
+- Prefer proxy route to avoid CORS and keep secrets off the client
+
+---
+
+## File map (where to look)
+
+- **Filter**: `src/filters/http-exception/http-exception.filter.ts`
+- **Module**: `src/bug-tracker/bug-tracker.module.ts`
+- **Service**: `src/bug-tracker/bug-tracker.service.ts`
+- **Schema**: `src/bug-tracker/schemas/bug-report.schema.ts`
+- **Controllers**: `src/bug-tracker/bug-intake.controller.ts`, `src/bug-tracker/bug-reports.controller.ts`
+- **Next proxy**: `src/app/api/bug-intake/route.ts`
+- **Client**: `src/app/_errors/ErrorScreen.tsx`, `src/lib/api.ts`, `src/lib/bugReporter.ts`
+
+---
+
+## FAQ
+
+- **Can I disable anytime?** Yes — flip the env flags; no code edits required.
+- **Does it loop with my Axios interceptor?** Add and respect a skip header (e.g., `x-skip-bug-report: 1`).
+- **Can I add more severities?** Yes — extend schema + classifier.
+- **Sentry?** You can store the `sentryEventId` alongside reports for cross-links.
 
 ```
 
@@ -2432,3 +2554,4 @@ This project is **UNLICENSED** and not for redistribution without written permis
 ## Feature Guides
 
 - [Prompts Registry](docs/prompts.md)
+```
