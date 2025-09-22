@@ -2450,9 +2450,9 @@ A drop‑in module to **capture, dedupe, assign, and track** backend (NestJS) er
    - In `main.ts`: register `HttpExceptionFilter` (DI-injected with `BugTrackerService`)
 
 4. **Expose admin APIs**
-   - `GET /admin/bug-reports` (filters: `status`, `severity`, `route`, `q`)
-   - `PATCH /admin/bug-reports/:fingerprint/assign`
-   - `PATCH /admin/bug-reports/:fingerprint/status`
+   - `GET /bug-trackers` (filters: `status`, `severity`, `route`, `q`)
+   - `PATCH /bug-trackers/:fingerprint/assign`
+   - `PATCH /bug-trackers/:fingerprint/status`
    - These are already documented in Swagger
 
 5. **Create frontend intake endpoint**
