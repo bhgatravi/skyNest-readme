@@ -2462,7 +2462,7 @@ A drop‑in module to **capture, dedupe, assign, and track** backend (NestJS) er
 6. **Next.js integration (client)**
    - Global error screen: re-export a central `ErrorScreen`
    - Axios interceptor: report `network/timeout` + `5xx`
-   - Next proxy route `/api/bug-intake` forwards to Nest `BUG_INTAKE_URL` with server-only `BUG_INTAKE_TOKEN`
+   - Next proxy route `/bug-intake` forwards to Nest `BUG_INTAKE_URL` with server-only `BUG_INTAKE_TOKEN`
 
 ---
 
@@ -2484,7 +2484,7 @@ BUG_INTAKE_URL=https://api.yourdomain.com/v1/bug-intake
 BUG_INTAKE_TOKEN=super-long-random
 ```
 
-> Use a **Next proxy route** (`/api/bug-intake`) so tokens stay **server-only**.
+> Use a **Next proxy route** (`/bug-intake`) so tokens stay **server-only**.
 
 ---
 
@@ -2533,7 +2533,7 @@ BUG_INTAKE_TOKEN=super-long-random
 - **Service**: `src/bug-tracker/bug-tracker.service.ts`
 - **Schema**: `src/bug-tracker/schemas/bug-report.schema.ts`
 - **Controllers**: `src/bug-tracker/bug-intake.controller.ts`, `src/bug-tracker/bug-reports.controller.ts`
-- **Next proxy**: `src/app/api/bug-intake/route.ts`
+- **Next proxy**: `src/app/bug-intake/route.ts`
 - **Client**: `src/app/_errors/ErrorScreen.tsx`, `src/lib/api.ts`, `src/lib/bugReporter.ts`
 
 ---
